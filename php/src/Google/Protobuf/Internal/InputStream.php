@@ -46,6 +46,9 @@ function combineInt32ToInt64($high, $low)
         }
     }
     $result = bcadd(bcmul($high, 4294967296), $low);
+    if ($low < 0) {
+        $result = bcadd($result, 4294967296);
+    }
     if ($isNeg) {
       $result = bcsub(0, $result);
     }
@@ -67,7 +70,6 @@ class InputStream
     private $total_bytes_read;
 
     const MAX_VARINT_BYTES = 10;
-    const MAX_VARINT32_BYTES = 5;
     const DEFAULT_RECURSION_LIMIT = 100;
     const DEFAULT_TOTAL_BYTES_LIMIT = 33554432; // 32 << 20, 32MB
 
@@ -160,40 +162,59 @@ class InputStream
      */
     public function readVarint64(&$var)
     {
-        $high = 0;
-        $low = 0;
         $count = 0;
-        $b = 0;
-
-        do {
-            if ($this->current === $this->buffer_end) {
-                return false;
-            }
-            if ($count === self::MAX_VARINT_BYTES) {
-                return false;
-            }
-            $b = ord($this->buffer[$this->current]);
-            $bits = 7 * $count;
-            if ($bits >= 32) {
-                $high |= (($b & 0x7F) << ($bits - 32));
-            } else if ($bits > 25){
-                $high_bits = $bits - 25;
-                $low = ($low | (($b & 0x7F) << $bits)) & (int) 0xFFFFFFFF;
-                $high = $b & ((0x1 << $high_bits) -1);
-            } else {
-                $low |= (($b & 0x7F) << $bits);
-            }
-
-            $this->advance(1);
-            $count += 1;
-        } while ($b & 0x80);
 
         if (PHP_INT_SIZE == 4) {
+            $high = 0;
+            $low = 0;
+            $b = 0;
+
+            do {
+                if ($this->current === $this->buffer_end) {
+                    return false;
+                }
+                if ($count === self::MAX_VARINT_BYTES) {
+                    return false;
+                }
+                $b = ord($this->buffer[$this->current]);
+                $bits = 7 * $count;
+                if ($bits >= 32) {
+                    $high |= (($b & 0x7F) << ($bits - 32));
+                } else if ($bits > 25){
+                    // $bits is 28 in this case.
+                    $low |= (($b & 0x7F) << 28);
+                    $high = ($b & 0x7F) >> 4;
+                } else {
+                    $low |= (($b & 0x7F) << $bits);
+                }
+
+                $this->advance(1);
+                $count += 1;
+            } while ($b & 0x80);
+
             $var = combineInt32ToInt64($high, $low);
         } else {
-            $var = ($high & 0xFFFFFFFF) << 32 |
-                   ($low & 0xFFFFFFFF);
+            $result = 0;
+            $shift = 0;
+
+            do {
+                if ($this->current === $this->buffer_end) {
+                    return false;
+                }
+                if ($count === self::MAX_VARINT_BYTES) {
+                    return false;
+                }
+
+                $byte = ord($this->buffer[$this->current]);
+                $result |= ($byte & 0x7f) << $shift;
+                $shift += 7;
+                $this->advance(1);
+                $count += 1;
+            } while ($byte > 0x7f);
+
+            $var = $result;
         }
+
         return true;
     }
 
@@ -309,6 +330,7 @@ class InputStream
      * passed unchanged to the corresponding call to popLimit().
      *
      * @param integer $byte_limit
+     * @throws Exception Fail to push limit.
      */
     public function pushLimit($byte_limit)
     {
@@ -318,19 +340,15 @@ class InputStream
 
         // security: byte_limit is possibly evil, so check for negative values
         // and overflow.
-        if ($byte_limit >= 0 && $byte_limit <= PHP_INT_MAX - $current_position) {
+        if ($byte_limit >= 0 &&
+            $byte_limit <= PHP_INT_MAX - $current_position &&
+            $byte_limit <= $this->current_limit - $current_position) {
             $this->current_limit = $current_position + $byte_limit;
+            $this->recomputeBufferLimits();
         } else {
-            // Negative or overflow.
-            $this->current_limit = PHP_INT_MAX;
+            throw new GPBDecodeException("Fail to push limit.");
         }
 
-        // We need to enforce all limits, not just the new one, so if the previous
-        // limit was before the new requested limit, we continue to enforce the
-        // previous limit.
-        $this->current_limit = min($this->current_limit, $old_limit);
-
-        $this->recomputeBufferLimits();
         return $old_limit;
     }
 
@@ -349,7 +367,7 @@ class InputStream
     }
 
     public function incrementRecursionDepthAndPushLimit(
-    $byte_limit, &$old_limit, &$recursion_budget)
+        $byte_limit, &$old_limit, &$recursion_budget)
     {
         $old_limit = $this->pushLimit($byte_limit);
         $recursion_limit = --$this->recursion_limit;
